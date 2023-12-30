@@ -6,6 +6,7 @@ const path = require("path");
 const port = 3000;
 const fs = require("fs");
 const auth0 = require("./auth0");
+const { validateJwt } = require("./jwt");
 
 const app = express();
 app.use(bodyParser.json());
@@ -90,16 +91,20 @@ app.use((req, res, next) => {
 });
 
 app.get("/", async (req, res) => {
-  if (req.session.access_token) {
+  const accessToken = req.session.access_token;
+  if (accessToken) {
+    validateJwt(accessToken)
+      .then((payload) => console.log(payload))
+      .catch((error) => {
+        throw new Error(error);
+      });
+
     const tokenLifetime =
       req.session.expires_at - Math.floor(Date.now() / 1000);
-			console.log(tokenLifetime);
     if (tokenLifetime <= 86385) {
-      const response = await auth0.refreshToken(
-        req.session.refresh_token
-      );
+      const response = await auth0.refreshToken(req.session.refresh_token);
       console.log("Old token:\n" + req.session.access_token);
-			console.log("Token was refreshed");
+      console.log("Token was refreshed");
       const responseObj = JSON.parse(response);
       console.log("New token:\n" + responseObj.access_token);
       req.session.access_token = responseObj.access_token;
