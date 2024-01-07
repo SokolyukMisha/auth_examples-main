@@ -1,144 +1,130 @@
-const uuid = require("uuid");
-const express = require("express");
-const onFinished = require("on-finished");
-const bodyParser = require("body-parser");
-const path = require("path");
+const express = require('express');
+const bodyParser = require('body-parser');
+const jwt = require('./jwt');
+const auth0 = require('./auth0');
+const path = require('path');
 const port = 3000;
-const fs = require("fs");
-const auth0 = require("./auth0");
-const { validateJwt } = require("./jwt");
 
 const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-const SESSION_KEY = "Authorization";
-
-class Session {
-  #sessions = {};
-
-  constructor() {
-    try {
-      this.#sessions = fs.readFileSync("./sessions.json", "utf8");
-      this.#sessions = JSON.parse(this.#sessions.trim());
-
-      console.log(this.#sessions);
-    } catch (e) {
-      this.#sessions = {};
-    }
-  }
-
-  #storeSessions() {
-    fs.writeFileSync(
-      "./sessions.json",
-      JSON.stringify(this.#sessions),
-      "utf-8"
-    );
-  }
-
-  set(key, value) {
-    if (!value) {
-      value = {};
-    }
-    this.#sessions[key] = value;
-    this.#storeSessions();
-  }
-
-  get(key) {
-    return this.#sessions[key];
-  }
-
-  init(res) {
-    const sessionId = uuid.v4();
-    this.set(sessionId);
-
-    return sessionId;
-  }
-
-  destroy(req, res) {
-    const sessionId = req.sessionId;
-    delete this.#sessions[sessionId];
-    this.#storeSessions();
-  }
-}
-
-const sessions = new Session();
 
 app.use((req, res, next) => {
-  let currentSession = {};
-  let sessionId = req.get(SESSION_KEY);
-
-  if (sessionId) {
-    currentSession = sessions.get(sessionId);
-    if (!currentSession) {
-      currentSession = {};
-      sessionId = sessions.init(res);
-    }
-  } else {
-    sessionId = sessions.init(res);
-  }
-
-  req.session = currentSession;
-  req.sessionId = sessionId;
-
-  onFinished(req, () => {
-    const currentSession = req.session;
-    const sessionId = req.sessionId;
-    sessions.set(sessionId, currentSession);
-  });
-
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,DELETE');
+  res.header(
+    'Access-Control-Allow-Headers',
+    'Origin, X-Requested With, Content-Type, Accept'
+  );
   next();
 });
 
-app.get("/", async (req, res) => {
-  const accessToken = req.session.access_token;
-  if (accessToken) {
-    validateJwt(accessToken)
-      .then((payload) => console.log(payload))
-      .catch((error) => {
-        throw new Error(error);
-      });
+const AUTHORIZATION_HEADER = 'authorization';
 
-    const tokenLifetime =
-      req.session.expires_at - Math.floor(Date.now() / 1000);
-    if (tokenLifetime <= 86385) {
-      const response = await auth0.refreshToken(req.session.refresh_token);
-      console.log("Old token:\n" + req.session.access_token);
-      console.log("Token was refreshed");
-      const responseObj = JSON.parse(response);
-      console.log("New token:\n" + responseObj.access_token);
-      req.session.access_token = responseObj.access_token;
-      req.session.expires_at =
-        Math.floor(Date.now() / 1000) + responseObj.expires_in;
+const asyncHandler = (fn) => (req, res, next) => {
+  fn(req, res, next).catch(next);
+};
+
+const login = async (req, res) => {
+  const { login, password } = req.body;
+
+  const tokens = await auth0.login(login, password);
+
+  if (tokens) {
+    res.cookie('refresh_token', tokens.refresh_token, {
+      httpOnly: true,
+      secure: false,
+    });
+    res.status(200).json({ token: tokens.access_token }).send();
+  } else {
+    res.status(401).send();
+  }
+};
+
+const refreshTokenIfNeeded = async (req, expires) => {
+  const dif = (expires - new Date()) / 1000 / 60;
+  if (dif > 5) {
+    return;
+  }
+
+  const tokens = auth0.refreshAccessToken(req.cookies.refresh_token);
+  res.cookie('refresh_token', tokens.refresh_token, {
+    httpOnly: true,
+    secure: false,
+  });
+  res.json({ token: tokens.access_token });
+};
+
+app.use(
+  asyncHandler(async (req, res, next) => {
+    const token = req.headers[AUTHORIZATION_HEADER];
+    if (token?.length) {
+      const tokenData = await jwt.validateJwt(token);
+      req.session = tokenData.principal;
+      await refreshTokenIfNeeded(req, tokenData.expires);
     }
 
+    next();
+  })
+);
+
+app.get('/', (req, res) => {
+  if (req.session?.username) {
     return res.json({
       username: req.session.username,
-      logout: "http://localhost:3000/logout",
+      logout: 'http://localhost:3000/logout',
     });
   }
-  res.sendFile(path.join(__dirname + "/index.html"));
+
+  res.sendFile(path.join(__dirname + '/index.html'));
 });
 
-app.get("/logout", (req, res) => {
+app.get('/logout', (req, res) => {
   sessions.destroy(req, res);
-  res.redirect("/");
+  res.clearCookie('refresh_token', {
+    httpOnly: true,
+    secure: false,
+    domain: 'localhost',
+    path: '/',
+  });
+  res.clearCookie('access_token', {
+    httpOnly: true,
+    secure: false,
+    domain: 'localhost',
+    path: '/',
+  });
+  res.status(204).send();
 });
 
-app.post("/api/login", async (req, res) => {
-  const { login, password } = req.body;
-  try {
-    const response = await auth0.login(login, password);
-    const parsed = JSON.parse(response);
-    req.session.username = login;
-    req.session.login = login;
-    req.session.access_token = parsed.access_token;
-    req.session.expires_at = Math.floor(Date.now() / 1000) + parsed.expires_in;
-    req.session.refresh_token = parsed.refresh_token;
-    res.json({ token: req.sessionId });
-  } catch (error) {
-    console.error(error);
+app.post('/api/login', async (req, res) => {
+  const redirectUrl = auth0.getLoginRedirectUri();
+  res.json({ redirectUrl });
+});
+
+app.get('/oidc-callback', async (req, res) => {
+  console.log(req.query);
+  const tokens = await auth0.getTokensFromCode(req.query.code);
+
+  if (tokens) {
+    res.cookie('refresh_token', tokens.refresh_token, {
+      httpOnly: true,
+      secure: false,
+    });
+    res.cookie('access_token', tokens.access_token, {
+      httpOnly: false,
+      secure: false,
+    });
+
+    res.redirect('/');
+  } else {
+    res.status(401).send();
   }
+});
+
+app.post('/api/signup', async (req, res) => {
+  await auth0.createUser(req.body.login, req.body.password);
+  return await login(req, res);
 });
 
 app.listen(port, () => {
